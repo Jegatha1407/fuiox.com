@@ -1,0 +1,41 @@
+name: Deploy Laravel Application
+
+on:
+  push:
+    branches:
+      - main
+
+
+jobs:
+
+  deploy:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+    - name: Deploy to Server
+
+      uses: appleboy/ssh-action@v1.0.3
+
+      with:
+
+        host: ${{ secrets.SERVER_IP }}
+
+        username: root
+
+        key: ${{ secrets.SERVER_SSH_KEY }}
+
+        script: |
+
+          cd /var/www/fuiox.com
+
+          git pull origin main
+
+          composer install --no-interaction --prefer-dist --optimize-autoloader
+
+          php artisan migrate --force
+
+          php artisan optimize:clear
+
+          php artisan optimize
