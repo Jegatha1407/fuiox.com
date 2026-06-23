@@ -1,0 +1,135 @@
+<?php
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
+use App\Models\User;
+
+class CampaignController extends Controller
+{
+    private function userId(): int { return session('auth_user'); }
+
+    // Campaigns page
+    public function campaigns()
+    {
+        $userId    = $this->userId();
+        $user      = User::findOrFail($userId);
+        $campaigns = DB::table('campaigns')->where('user_id',$userId)->orderByDesc('created_at')->get();
+        $stats     = [
+            'total'  => $campaigns->count(),
+            'sent'   => $campaigns->sum('sent'),
+            'failed' => $campaigns->sum('failed'),
+        ];
+        return view('user.campaigns', compact('user','campaigns','stats'));
+    }
+
+    public function list()
+    {
+        $userId    = $this->userId();
+        $campaigns = DB::table('campaigns')->where('user_id',$userId)->orderByDesc('created_at')->get();
+        return response()->json(['campaigns' => $campaigns]);
+    }
+    // Stats JSON
+    public function stats()
+    {
+        $userId = $this->userId();
+        $camps  = DB::table('campaigns')->where('user_id',$userId)->get();
+        return response()->json(['total'=>$camps->count(),'sent'=>$camps->sum('sent'),'failed'=>$camps->sum('failed')]);
+    }
+
+    // Store - launch campaign
+    public function store(Request $request)
+    {
+        $request->validate(['name'=>'required','template_name'=>'required','phones'=>'required|array']);
+        $userId = $this->userId();
+        $user   = User::findOrFail($userId);
+
+        // Handle scheduling
+        $scheduledAt = null;
+        if (!empty($request->scheduled_at)) {
+            try {
+                $scheduledAt = \Carbon\Carbon::parse($request->scheduled_at);
+            } catch (\Exception $e) {
+                $scheduledAt = null;
+            }
+        }
+
+        if ($scheduledAt && $scheduledAt->isFuture()) {
+            $campId = DB::table('campaigns')->insertGetId([
+                'user_id'       => $userId,
+                'name'          => $request->name,
+                'template_name' => $request->template_name,
+                'language_code' => $request->language_code ?? 'en_US',
+                'total'         => count($request->phones),
+                'sent'          => 0,
+                'failed'        => 0,
+                'status'        => 'scheduled',
+                'scheduled_at'  => $scheduledAt,
+                'created_at'    => now(),
+                'updated_at'    => now(),
+            ]);
+            foreach ($request->phones as $phone) {
+                $phone = preg_replace('/[^0-9]/','', $phone);
+                if (strlen($phone) >= 8) {
+                    DB::table('campaign_recipients')->insert(['campaign_id'=>$campId,'phone'=>$phone]);
+                }
+            }
+            return response()->json(['success'=>true,'sent'=>0,'failed'=>0,'total'=>count($request->phones),'id'=>$campId,'status'=>'scheduled']);
+        }
+
+        // Send now
+        $sent = 0; $failed = 0; $failedNumbers = [];
+
+        // Build components
+        $components = [];
+        if (!empty($request->header_image)) {
+            $components[] = ['type'=>'header','parameters'=>[['type'=>'image','image'=>['link'=>$request->header_image]]]];
+        }
+        if (!empty($request->parameters)) {
+            $components[] = ['type'=>'body','parameters'=>array_map(fn($p)=>['type'=>'text','text'=>$p],$request->parameters)];
+        }
+
+        $tpl = ['name'=>$request->template_name,'language'=>['code'=>$request->language_code??'en_US']];
+        if (!empty($components)) $tpl['components'] = $components;
+
+        foreach ($request->phones as $phone) {
+            $phone = preg_replace('/[^0-9]/','', $phone);
+            if (strlen($phone) < 8) { $failed++; $failedNumbers[] = $phone.' (invalid)'; continue; }
+            $resp = Http::withToken($user->access_token)
+                ->post("https://graph.facebook.com/v19.0/{$user->phone_number_id}/messages",[
+                    'messaging_product'=>'whatsapp','to'=>$phone,'type'=>'template','template'=>$tpl
+                ]);
+            if ($resp->successful()) {
+                $sent++;
+            } else {
+                $failed++;
+                $errMsg = $resp->json('error.message') ?? $resp->json('error.error_data.details') ?? 'failed';
+                $failedNumbers[] = $phone.' ('.$errMsg.')';
+                Log::error('Campaign send failed',['phone'=>$phone,'response'=>$resp->json()]);
+            }
+        }
+
+        $campId = DB::table('campaigns')->insertGetId([
+            'user_id'        => $userId,
+            'name'           => $request->name,
+            'template_name'  => $request->template_name,
+            'language_code'  => $request->language_code ?? 'en_US',
+            'total'          => count($request->phones),
+            'sent'           => $sent,
+            'failed'         => $failed,
+            'failed_numbers' => !empty($failedNumbers) ? implode("\n",$failedNumbers) : null,
+            'status'         => $sent > 0 ? 'completed' : 'failed',
+            'completed_at'   => now(),
+            'created_at'     => now(),
+            'updated_at'     => now(),
+        ]);
+
+        return response()->json(['success'=>true,'sent'=>$sent,'failed'=>$failed,'failed_numbers'=>$failedNumbers,'total'=>count($request->phones),'id'=>$campId]);
+    }
+    public function destroy($id)
+    {
+        DB::table('campaigns')->where('id',$id)->where('user_id',$this->userId())->delete();
+        return response()->json(['success'=>true]);
+    }
+}
