@@ -1,4 +1,4 @@
-@extends('layouts.admin')z
+@extends('layouts.admin')
 
 @section('title', 'Credential Requests')
 @section('page_title', 'Credential Update Requests')
